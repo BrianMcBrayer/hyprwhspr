@@ -105,10 +105,13 @@ Use the install script to automatically install dependencies for your distro:
 # Download and run the install script
 curl -fsSL https://raw.githubusercontent.com/goodroot/hyprwhspr/main/scripts/install-deps.sh | bash
 
+# Install uv (Python package manager) if not already installed
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 # Clone and run setup
 git clone https://github.com/goodroot/hyprwhspr.git ~/hyprwhspr
 cd ~/hyprwhspr
-./bin/hyprwhspr setup
+uv run hyprwhspr setup
 ```
 
 The script supports Ubuntu, Debian, Fedora, and openSUSE.
@@ -135,13 +138,13 @@ wget http://deb.debian.org/debian/pool/main/y/ydotool/ydotool_1.0.4-2~bpo13+1_am
 sudo dpkg -i ydotool_1.0.4-2~bpo13+1_amd64.deb
 sudo apt install -f  # Fix any dependency issues
 
-# Install Python packages not in Debian repos
-pip install --user --break-system-packages sounddevice pyperclip
+# Install uv (Python package manager)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone and run setup
 git clone https://github.com/goodroot/hyprwhspr.git ~/hyprwhspr
 cd ~/hyprwhspr
-./bin/hyprwhspr setup
+uv run hyprwhspr setup
 ```
 
 > **Note:** On Ubuntu 22.04 LTS, `gir1.2-gtk4layershell-1.0` may not be available. The mic-osd visualizer will be disabled, but dictation works fine without it.
@@ -156,10 +159,13 @@ sudo dnf install python3 python3-pip python3-devel git cmake make gcc-c++ \
     python3-gobject gtk4 gtk4-layer-shell \
     pipewire pipewire-pulseaudio ydotool wl-clipboard
 
+# Install uv (Python package manager)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 # Clone and run setup
 git clone https://github.com/goodroot/hyprwhspr.git ~/hyprwhspr
 cd ~/hyprwhspr
-./bin/hyprwhspr setup
+uv run hyprwhspr setup
 ```
 
 **openSUSE:**
@@ -176,10 +182,13 @@ sudo zypper install python3 python3-pip python3-devel git cmake make gcc-c++ \
 # sudo zypper addrepo https://download.opensuse.org/repositories/devel:languages:zig/openSUSE_Tumbleweed/devel:languages:zig.repo
 # sudo zypper refresh && sudo zypper install gtk4-layer-shell
 
+# Install uv (Python package manager)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 # Clone and run setup
 git clone https://github.com/goodroot/hyprwhspr.git ~/hyprwhspr
 cd ~/hyprwhspr
-./bin/hyprwhspr setup
+uv run hyprwhspr setup
 ```
 
 </details>
@@ -188,7 +197,7 @@ cd ~/hyprwhspr
 
 The setup wizard handles most configuration automatically:
 
-- Creates `~/.local/bin/hyprwhspr` symlink (so the command works from anywhere)
+- Creates virtual environment with dependencies via uv
 - Configures systemd services
 - Sets up permissions (groups, udev rules)
 
@@ -197,7 +206,8 @@ After setup completes:
 ```bash
 # Log out and back in for group permissions to take effect
 # Then verify everything is running:
-hyprwhspr status
+cd ~/hyprwhspr
+uv run hyprwhspr status
 ```
 
 > **Note:** On non-Arch systems, the setup will guide you through any missing dependencies. GPU acceleration (CUDA/Vulkan) requires additional packages - the setup will provide instructions.

@@ -420,24 +420,15 @@ def download_pywhispercpp_wheel(variant: Optional[str] = None) -> Optional[Path]
         return None
 
 
-def install_pywhispercpp_from_wheel(pip_bin: Path, wheel_path: Path) -> bool:
+def install_pywhispercpp_from_wheel(venv_dir: Path, wheel_path: Path) -> bool:
     """Install pywhispercpp from a pre-built wheel file."""
     log_info(f"Installing from wheel: {wheel_path.name}")
 
     try:
-        # Setup environment
-        if _check_mise_active():
-            env = _create_mise_free_environment()
-        else:
-            env = os.environ.copy()
-
-        venv_bin = str(VENV_DIR / 'bin')
-        env['PATH'] = f"{venv_bin}:{env.get('PATH', '')}"
-
         run_command(
-            [str(pip_bin), 'install', '--force-reinstall', str(wheel_path)],
-            check=True,
-            env=env
+            ['uv', 'pip', 'install', '--python', str(venv_dir / 'bin' / 'python'),
+             '--force-reinstall', str(wheel_path)],
+            check=True
         )
         log_success("pywhispercpp installed from pre-built wheel")
         return True
@@ -1010,10 +1001,10 @@ def setup_vulkan_support() -> bool:
 # ==================== Python Environment ====================
 
 def setup_python_venv(force_rebuild: bool = False) -> Path:
-    """Create or update Python virtual environment. Returns path to pip binary.
+    """Create or update Python virtual environment using uv. Returns venv directory path.
 
     Args:
-        force_rebuild: If True, delete and recreate venv even if it exists and Python version matches.
+        force_rebuild: If True, delete and recreate venv even if it exists.
     """
     log_info("Setting up Python virtual environment…")
 
@@ -1023,97 +1014,25 @@ def setup_python_venv(force_rebuild: bool = False) -> Path:
         log_error(f"requirements.txt not found at {requirements_file}")
         raise FileNotFoundError(f"requirements.txt not found at {requirements_file}")
 
-    # Check if mise is active - if so, use system Python for venv creation
-    mise_active = _check_mise_active()
-    python_executable = sys.executable
-    
-    if mise_active:
-        log_info("MISE detected - using system Python for venv creation")
-        python_executable = _get_system_python()
-        log_info(f"Using system Python: {python_executable}")
+    # Force rebuild if requested
+    if force_rebuild and VENV_DIR.exists():
+        log_info(f"Force rebuild requested - removing existing venv at {VENV_DIR}")
+        shutil.rmtree(VENV_DIR)
 
-    # Check if venv exists and if Python version matches
-    venv_needs_recreation = force_rebuild
-    if force_rebuild:
-        log_info("Force rebuild requested - will recreate venv")
-    if VENV_DIR.exists() and not force_rebuild:
-        venv_python = VENV_DIR / 'bin' / 'python'
-        if venv_python.exists():
-            try:
-                # Check Python version in venv
-                result = run_command([str(venv_python), '--version'], check=False, capture_output=True)
-                venv_version = result.stdout.strip() if result.returncode == 0 and result.stdout else ""
-                
-                # Get version of python_executable (system Python when mise is active, otherwise current Python)
-                python_exec_version_result = run_command(
-                    [python_executable, '--version'],
-                    check=False,
-                    capture_output=True
-                )
-                python_exec_version = python_exec_version_result.stdout.strip() if python_exec_version_result.returncode == 0 and python_exec_version_result.stdout else ""
-                
-                # Extract major.minor from both version strings
-                import re
-                venv_major_minor = ""
-                if venv_version:
-                    match = re.search(r'(\d+)\.(\d+)', venv_version)
-                    if match:
-                        venv_major_minor = f"{match.group(1)}.{match.group(2)}"
-                
-                python_exec_major_minor = ""
-                if python_exec_version:
-                    match = re.search(r'(\d+)\.(\d+)', python_exec_version)
-                    if match:
-                        python_exec_major_minor = f"{match.group(1)}.{match.group(2)}"
-                
-                # If we couldn't get python_exec version, handle based on whether it's the same as current Python
-                if not python_exec_major_minor:
-                    if python_executable == sys.executable:
-                        # Same Python, safe to use sys.version_info as fallback
-                        python_exec_major_minor = f"{sys.version_info.major}.{sys.version_info.minor}"
-                        python_exec_version = f"Python {python_exec_major_minor} (from sys.version_info)"
-                    else:
-                        # Different Python - can't verify version, be conservative and recreate venv
-                        log_warning(f"Could not determine version of target Python ({python_executable})")
-                        log_warning("Cannot verify venv Python version compatibility - will recreate venv to be safe")
-                        venv_needs_recreation = True
-                        # Skip version comparison since we don't have valid data
-                        python_exec_major_minor = None
-                
-                # Check if versions match (major.minor) - only if we have valid version data
-                if python_exec_major_minor and venv_major_minor and venv_major_minor != python_exec_major_minor:
-                    log_warning(f"Venv Python version mismatch: venv has {venv_version}, target Python is {python_exec_version}")
-                    log_info("Recreating venv to match target Python version...")
-                    venv_needs_recreation = True
-            except Exception:
-                # If we can't check, assume it's fine
-                pass
-        else:
-            venv_needs_recreation = True
-    
-    # Recreate venv if needed
-    if venv_needs_recreation or not VENV_DIR.exists():
-        if VENV_DIR.exists():
-            log_info(f"Removing existing venv at {VENV_DIR}")
-            import shutil
-            shutil.rmtree(VENV_DIR)
+    # Create venv with uv if it doesn't exist
+    if not VENV_DIR.exists():
         log_info(f"Creating venv at {VENV_DIR}")
         VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
         # Use --system-site-packages to access system GTK/GLib bindings (python-gobject)
-        run_command([python_executable, '-m', 'venv', '--system-site-packages', str(VENV_DIR)], check=True)
+        run_command([
+            'uv', 'venv',
+            '--system-site-packages',
+            str(VENV_DIR)
+        ], check=True)
     else:
         log_info(f"Venv already exists at {VENV_DIR}")
-    
-    # Get pip binary
-    pip_bin = VENV_DIR / 'bin' / 'pip'
-    if not pip_bin.exists():
-        log_error(f"pip not found in venv at {VENV_DIR}")
-        raise FileNotFoundError(f"pip not found in venv")
-    
-    # Upgrade pip and wheel (mise-free env applied automatically via run_command)
-    run_command([str(pip_bin), 'install', '--upgrade', 'pip', 'wheel'], check=True)
-    
-    return pip_bin
+
+    return VENV_DIR
 
 
 # ==================== pywhispercpp Installation ====================
@@ -1178,9 +1097,11 @@ def _filter_requirements(requirements_file: Path, skip_packages: list) -> Path:
         raise
 
 
-def install_pywhispercpp_cpu(pip_bin: Path, requirements_file: Path) -> bool:
+def install_pywhispercpp_cpu(venv_dir: Path, requirements_file: Path) -> bool:
     """Install CPU-only pywhispercpp"""
     log_info("Installing pywhispercpp (CPU-only)...")
+
+    venv_python = str(venv_dir / 'bin' / 'python')
 
     # Track if wheel was successfully installed (to avoid overwriting with PyPI version)
     wheel_installed = False
@@ -1188,7 +1109,7 @@ def install_pywhispercpp_cpu(pip_bin: Path, requirements_file: Path) -> bool:
     # Try pre-built wheel first (faster than pip resolving from PyPI)
     wheel_path = download_pywhispercpp_wheel(variant='cpu')
     if wheel_path:
-        if install_pywhispercpp_from_wheel(pip_bin, wheel_path):
+        if install_pywhispercpp_from_wheel(venv_dir, wheel_path):
             wheel_installed = True
             # Still need to install other requirements
             skip_packages = ['pywhispercpp']
@@ -1197,16 +1118,17 @@ def install_pywhispercpp_cpu(pip_bin: Path, requirements_file: Path) -> bool:
             temp_req_path = None
             try:
                 temp_req_path = _filter_requirements(requirements_file, skip_packages)
-                run_command([str(pip_bin), 'install', '-r', str(temp_req_path)], check=True)
+                run_command(['uv', 'pip', 'install', '--python', venv_python,
+                            '-r', str(temp_req_path)], check=True)
                 return True
             except subprocess.CalledProcessError as e:
                 log_warning(f"Wheel installed but remaining deps failed: {e}")
-                log_warning("Falling back to full pip install...")
+                log_warning("Falling back to full uv pip install...")
             finally:
                 if temp_req_path and temp_req_path.exists():
                     temp_req_path.unlink()
         else:
-            log_warning("Pre-built wheel failed, falling back to pip install...")
+            log_warning("Pre-built wheel failed, falling back to uv pip install...")
 
     # Build skip list - always skip pywhispercpp if wheel was already installed
     skip_packages = []
@@ -1223,7 +1145,8 @@ def install_pywhispercpp_cpu(pip_bin: Path, requirements_file: Path) -> bool:
         else:
             install_file = requirements_file
 
-        run_command([str(pip_bin), 'install', '-r', str(install_file)], check=True)
+        run_command(['uv', 'pip', 'install', '--python', venv_python,
+                    '-r', str(install_file)], check=True)
         log_success("pywhispercpp installed (CPU-only mode)")
         return True
     except subprocess.CalledProcessError as e:
@@ -1234,14 +1157,16 @@ def install_pywhispercpp_cpu(pip_bin: Path, requirements_file: Path) -> bool:
             temp_req_path.unlink()
 
 
-def install_pywhispercpp_cuda(pip_bin: Path) -> bool:
+def install_pywhispercpp_cuda(venv_dir: Path) -> bool:
     """Install pywhispercpp with CUDA support"""
     log_info("Installing pywhispercpp with CUDA support...")
+
+    venv_python = str(venv_dir / 'bin' / 'python')
 
     # Try pre-built wheel first (much faster than source build)
     wheel_path = download_pywhispercpp_wheel()  # Auto-detects CUDA version
     if wheel_path:
-        if install_pywhispercpp_from_wheel(pip_bin, wheel_path):
+        if install_pywhispercpp_from_wheel(venv_dir, wheel_path):
             return True
         log_warning("Pre-built wheel failed, falling back to source build...")
 
@@ -1250,7 +1175,6 @@ def install_pywhispercpp_cuda(pip_bin: Path) -> bool:
     # Clean build artifacts if they exist (to avoid Python version mismatches)
     if PYWHISPERCPP_SRC_DIR.exists():
         log_info("Cleaning existing build artifacts...")
-        import shutil
         # Remove common build directories
         build_dirs = [
             PYWHISPERCPP_SRC_DIR / 'build',
@@ -1261,24 +1185,24 @@ def install_pywhispercpp_cuda(pip_bin: Path) -> bool:
         for build_dir in build_dirs:
             if build_dir.exists():
                 shutil.rmtree(build_dir, ignore_errors=True)
-        
+
         # Remove egg-info directories
         for egg_info in PYWHISPERCPP_SRC_DIR.glob('*.egg-info'):
             if egg_info.is_dir():
                 shutil.rmtree(egg_info, ignore_errors=True)
-        
+
         # Remove CMake cache files (these can cache Python version)
         for cmake_cache in PYWHISPERCPP_SRC_DIR.rglob('CMakeCache.txt'):
             cmake_cache.unlink(missing_ok=True)
         for cmake_files in PYWHISPERCPP_SRC_DIR.rglob('CMakeFiles'):
             if cmake_files.is_dir():
                 shutil.rmtree(cmake_files, ignore_errors=True)
-        
+
         # Clean __pycache__ directories
         for pycache in PYWHISPERCPP_SRC_DIR.rglob('__pycache__'):
             if pycache.is_dir():
                 shutil.rmtree(pycache, ignore_errors=True)
-    
+
     # Clone or update pywhispercpp sources
     if not PYWHISPERCPP_SRC_DIR.exists() or not (PYWHISPERCPP_SRC_DIR / '.git').exists():
         log_info(f"Cloning pywhispercpp sources (v1.4.0) → {PYWHISPERCPP_SRC_DIR}")
@@ -1303,61 +1227,57 @@ def install_pywhispercpp_cuda(pip_bin: Path) -> bool:
         verbosity = OutputController.get_verbosity()
         verbose = verbosity.value >= VerbosityLevel.VERBOSE.value
         try:
-            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'fetch', '--tags'], 
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'fetch', '--tags'],
                        check=False, verbose=verbose)
-            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'checkout', PYWHISPERCPP_PINNED_COMMIT], 
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'checkout', PYWHISPERCPP_PINNED_COMMIT],
                        check=False, verbose=verbose)
-            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'submodule', 'update', '--init', '--recursive'], 
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'submodule', 'update', '--init', '--recursive'],
                        check=False, verbose=verbose)
         except Exception as e:
             log_warning(f"Could not update pywhispercpp repository to v1.4.0: {e}")
-    
+
     # Build with CUDA support
-    log_info("Building pywhispercpp with CUDA (ggml CUDA) via pip - may take several minutes")
-    # Start with mise-free environment if mise is active, otherwise use current environment
-    if _check_mise_active():
-        env = _create_mise_free_environment()
-    else:
-        env = os.environ.copy()
+    log_info("Building pywhispercpp with CUDA (ggml CUDA) via uv pip - may take several minutes")
+    env = os.environ.copy()
     env['GGML_CUDA'] = 'ON'
-    
+
     # Force CMake to use venv's Python (critical for correct Python version detection)
-    venv_python = VENV_DIR / 'bin' / 'python'
     env['CMAKE_ARGS'] = f"-DPython3_EXECUTABLE={venv_python}"
-    env['PYTHON_EXECUTABLE'] = str(venv_python)
-    
+    env['PYTHON_EXECUTABLE'] = venv_python
+
     # Also ensure venv's bin is first in PATH so CMake finds the right tools
-    venv_bin = str(VENV_DIR / 'bin')
+    venv_bin = str(venv_dir / 'bin')
     env['PATH'] = f"{venv_bin}:{env.get('PATH', '')}"
-    
+
     try:
         # Only use -v flag if verbose mode is enabled
         verbosity = OutputController.get_verbosity()
         pip_args = [
-            str(pip_bin), 'install',
+            'uv', 'pip', 'install', '--python', venv_python,
             '-e', str(PYWHISPERCPP_SRC_DIR),
-            '--no-cache-dir',
-            '--force-reinstall'
+            '--no-cache',
+            '--reinstall'
         ]
         if verbosity.value >= VerbosityLevel.VERBOSE.value:
             pip_args.append('-v')
-        
+
         run_command(pip_args, check=True, env=env, verbose=verbosity.value >= VerbosityLevel.VERBOSE.value)
-        log_success("pywhispercpp installed with CUDA acceleration via pip")
+        log_success("pywhispercpp installed with CUDA acceleration via uv pip")
         return True
     except subprocess.CalledProcessError as e:
-        log_error(f"pip install of pywhispercpp with CUDA failed: {e}")
+        log_error(f"uv pip install of pywhispercpp with CUDA failed: {e}")
         return False
 
 
-def install_pywhispercpp_rocm(pip_bin: Path) -> Tuple[bool, bool]:
+def install_pywhispercpp_rocm(venv_dir: Path) -> Tuple[bool, bool]:
     """Install pywhispercpp with ROCm support. Returns (success, should_fallback)."""
     log_info("Installing pywhispercpp with ROCm support...")
-    
+
+    venv_python = str(venv_dir / 'bin' / 'python')
+
     # Clean build artifacts if they exist (to avoid Python version mismatches)
     if PYWHISPERCPP_SRC_DIR.exists():
         log_info("Cleaning existing build artifacts...")
-        import shutil
         # Remove common build directories
         build_dirs = [
             PYWHISPERCPP_SRC_DIR / 'build',
@@ -1368,24 +1288,24 @@ def install_pywhispercpp_rocm(pip_bin: Path) -> Tuple[bool, bool]:
         for build_dir in build_dirs:
             if build_dir.exists():
                 shutil.rmtree(build_dir, ignore_errors=True)
-        
+
         # Remove egg-info directories
         for egg_info in PYWHISPERCPP_SRC_DIR.glob('*.egg-info'):
             if egg_info.is_dir():
                 shutil.rmtree(egg_info, ignore_errors=True)
-        
+
         # Remove CMake cache files (these can cache Python version)
         for cmake_cache in PYWHISPERCPP_SRC_DIR.rglob('CMakeCache.txt'):
             cmake_cache.unlink(missing_ok=True)
         for cmake_files in PYWHISPERCPP_SRC_DIR.rglob('CMakeFiles'):
             if cmake_files.is_dir():
                 shutil.rmtree(cmake_files, ignore_errors=True)
-        
+
         # Clean __pycache__ directories
         for pycache in PYWHISPERCPP_SRC_DIR.rglob('__pycache__'):
             if pycache.is_dir():
                 shutil.rmtree(pycache, ignore_errors=True)
-    
+
     # Clone or update pywhispercpp sources
     if not PYWHISPERCPP_SRC_DIR.exists() or not (PYWHISPERCPP_SRC_DIR / '.git').exists():
         log_info(f"Cloning pywhispercpp sources (v1.4.0) → {PYWHISPERCPP_SRC_DIR}")
@@ -1410,61 +1330,56 @@ def install_pywhispercpp_rocm(pip_bin: Path) -> Tuple[bool, bool]:
         verbosity = OutputController.get_verbosity()
         verbose = verbosity.value >= VerbosityLevel.VERBOSE.value
         try:
-            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'fetch', '--tags'], 
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'fetch', '--tags'],
                        check=False, verbose=verbose)
-            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'checkout', PYWHISPERCPP_PINNED_COMMIT], 
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'checkout', PYWHISPERCPP_PINNED_COMMIT],
                        check=False, verbose=verbose)
-            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'submodule', 'update', '--init', '--recursive'], 
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'submodule', 'update', '--init', '--recursive'],
                        check=False, verbose=verbose)
         except Exception as e:
             log_warning(f"Could not update pywhispercpp repository to v1.4.0: {e}")
-    
+
     # Set up ROCm environment
     rocm_path = os.environ.get('ROCM_PATH', '/opt/rocm')
-    # Start with mise-free environment if mise is active, otherwise use current environment
-    if _check_mise_active():
-        env = _create_mise_free_environment()
-    else:
-        env = os.environ.copy()
+    env = os.environ.copy()
     env['ROCM_PATH'] = rocm_path
     env['PATH'] = f"{rocm_path}/bin:" + env.get('PATH', '')
     env['GGML_HIPBLAS'] = 'ON'
     env['GGML_HIP'] = 'ON'
     env['GGML_ROCM'] = '1'
     env['CMAKE_PREFIX_PATH'] = rocm_path
-    
+
     # Force CMake to use venv's Python (critical for correct Python version detection)
-    venv_python = VENV_DIR / 'bin' / 'python'
     env['CMAKE_ARGS'] = f"-DPython3_EXECUTABLE={venv_python}"
-    env['PYTHON_EXECUTABLE'] = str(venv_python)
-    
+    env['PYTHON_EXECUTABLE'] = venv_python
+
     # Ensure venv's bin is first in PATH (after ROCm) so CMake finds the right tools
-    venv_bin = str(VENV_DIR / 'bin')
+    venv_bin = str(venv_dir / 'bin')
     env['PATH'] = f"{venv_bin}:{env.get('PATH', '')}"
-    
+
     # Build with ROCm support
-    log_info("Building pywhispercpp with ROCm (ggml HIPBLAS) via pip")
+    log_info("Building pywhispercpp with ROCm (ggml HIPBLAS) via uv pip")
     try:
         # Only use -v flag if verbose mode is enabled
         verbosity = OutputController.get_verbosity()
         pip_args = [
-            str(pip_bin), 'install',
+            'uv', 'pip', 'install', '--python', venv_python,
             '-e', str(PYWHISPERCPP_SRC_DIR),
-            '--no-cache-dir',
-            '--force-reinstall'
+            '--no-cache',
+            '--reinstall'
         ]
         if verbosity.value >= VerbosityLevel.VERBOSE.value:
             pip_args.append('-v')
-        
+
         run_command(pip_args, check=True, env=env, verbose=verbosity.value >= VerbosityLevel.VERBOSE.value)
-        log_success("pywhispercpp installed with ROCm acceleration via pip")
+        log_success("pywhispercpp installed with ROCm acceleration via uv pip")
         return True, False
     except subprocess.CalledProcessError:
         # Build failed - return should_fallback=True
         return False, True
 
 
-def install_pywhispercpp_vulkan(pip_bin: Path) -> bool:
+def install_pywhispercpp_vulkan(venv_dir: Path) -> bool:
     """Install pywhispercpp with Vulkan support.
 
     Uses GGML_VULKAN=1 environment variable to enable Vulkan acceleration.
@@ -1476,10 +1391,11 @@ def install_pywhispercpp_vulkan(pip_bin: Path) -> bool:
     """
     log_info("Installing pywhispercpp with Vulkan support...")
 
+    venv_python = str(venv_dir / 'bin' / 'python')
+
     # Clean build artifacts if they exist (to avoid Python version mismatches)
     if PYWHISPERCPP_SRC_DIR.exists():
         log_info("Cleaning existing build artifacts...")
-        import shutil
         # Remove common build directories
         build_dirs = [
             PYWHISPERCPP_SRC_DIR / 'build',
@@ -1542,38 +1458,33 @@ def install_pywhispercpp_vulkan(pip_bin: Path) -> bool:
             log_warning(f"Could not update pywhispercpp repository to v1.4.0: {e}")
 
     # Set up Vulkan environment
-    # Start with mise-free environment if mise is active, otherwise use current environment
-    if _check_mise_active():
-        env = _create_mise_free_environment()
-    else:
-        env = os.environ.copy()
+    env = os.environ.copy()
     env['GGML_VULKAN'] = '1'
 
     # Force CMake to use venv's Python (critical for correct Python version detection)
-    venv_python = VENV_DIR / 'bin' / 'python'
     env['CMAKE_ARGS'] = f"-DPython3_EXECUTABLE={venv_python}"
-    env['PYTHON_EXECUTABLE'] = str(venv_python)
+    env['PYTHON_EXECUTABLE'] = venv_python
 
     # Ensure venv's bin is first in PATH so CMake finds the right tools
-    venv_bin = str(VENV_DIR / 'bin')
+    venv_bin = str(venv_dir / 'bin')
     env['PATH'] = f"{venv_bin}:{env.get('PATH', '')}"
 
     # Build with Vulkan support
-    log_info("Building pywhispercpp with Vulkan via pip")
+    log_info("Building pywhispercpp with Vulkan via uv pip")
     try:
         # Only use -v flag if verbose mode is enabled
         verbosity = OutputController.get_verbosity()
         pip_args = [
-            str(pip_bin), 'install',
+            'uv', 'pip', 'install', '--python', venv_python,
             '-e', str(PYWHISPERCPP_SRC_DIR),
-            '--no-cache-dir',
-            '--force-reinstall'
+            '--no-cache',
+            '--reinstall'
         ]
         if verbosity.value >= VerbosityLevel.VERBOSE.value:
             pip_args.append('-v')
 
         run_command(pip_args, check=True, env=env, verbose=verbosity.value >= VerbosityLevel.VERBOSE.value)
-        log_success("pywhispercpp installed with Vulkan acceleration via pip")
+        log_success("pywhispercpp installed with Vulkan acceleration via uv pip")
         return True
     except subprocess.CalledProcessError as e:
         log_error(f"Failed to install pywhispercpp with Vulkan: {e}")
@@ -1633,10 +1544,10 @@ def download_pywhispercpp_model(model_name: str = 'base') -> bool:
 # ==================== Parakeet Installation ====================
 
 def setup_parakeet_venv(force_rebuild: bool = False) -> Path:
-    """Create or update Parakeet Python virtual environment. Returns path to pip binary.
+    """Create or update Parakeet Python virtual environment using uv. Returns venv directory path.
 
     Args:
-        force_rebuild: If True, delete and recreate venv even if it exists and Python version matches.
+        force_rebuild: If True, delete and recreate venv even if it exists.
     """
     log_info("Setting up Parakeet Python virtual environment…")
 
@@ -1645,102 +1556,29 @@ def setup_parakeet_venv(force_rebuild: bool = False) -> Path:
         log_error(f"Parakeet requirements.txt not found at {PARAKEET_REQUIREMENTS}")
         raise FileNotFoundError(f"Parakeet requirements.txt not found at {PARAKEET_REQUIREMENTS}")
 
-    # Check if mise is active - if so, use system Python for venv creation
-    mise_active = _check_mise_active()
-    python_executable = sys.executable
-    
-    if mise_active:
-        log_info("MISE detected - using system Python for Parakeet venv creation")
-        python_executable = _get_system_python()
-        log_info(f"Using system Python: {python_executable}")
+    # Force rebuild if requested
+    if force_rebuild and PARAKEET_VENV_DIR.exists():
+        log_info(f"Force rebuild requested - removing existing Parakeet venv at {PARAKEET_VENV_DIR}")
+        shutil.rmtree(PARAKEET_VENV_DIR)
 
-    # Check if venv exists and if Python version matches
-    venv_needs_recreation = force_rebuild
-    if force_rebuild:
-        log_info("Force rebuild requested - will recreate venv")
-    if PARAKEET_VENV_DIR.exists() and not force_rebuild:
-        venv_python = PARAKEET_VENV_DIR / 'bin' / 'python'
-        if venv_python.exists():
-            try:
-                # Check Python version in venv
-                result = run_command([str(venv_python), '--version'], check=False, capture_output=True)
-                venv_version = result.stdout.strip() if result.returncode == 0 and result.stdout else ""
-                
-                # Get version of python_executable (system Python when mise is active, otherwise current Python)
-                python_exec_version_result = run_command(
-                    [python_executable, '--version'],
-                    check=False,
-                    capture_output=True
-                )
-                python_exec_version = python_exec_version_result.stdout.strip() if python_exec_version_result.returncode == 0 and python_exec_version_result.stdout else ""
-                
-                # Extract major.minor from both version strings
-                import re
-                venv_major_minor = ""
-                if venv_version:
-                    match = re.search(r'(\d+)\.(\d+)', venv_version)
-                    if match:
-                        venv_major_minor = f"{match.group(1)}.{match.group(2)}"
-                
-                python_exec_major_minor = ""
-                if python_exec_version:
-                    match = re.search(r'(\d+)\.(\d+)', python_exec_version)
-                    if match:
-                        python_exec_major_minor = f"{match.group(1)}.{match.group(2)}"
-                
-                # If we couldn't get python_exec version, handle based on whether it's the same as current Python
-                if not python_exec_major_minor:
-                    if python_executable == sys.executable:
-                        # Same Python, safe to use sys.version_info as fallback
-                        python_exec_major_minor = f"{sys.version_info.major}.{sys.version_info.minor}"
-                        python_exec_version = f"Python {python_exec_major_minor} (from sys.version_info)"
-                    else:
-                        # Different Python - can't verify version, be conservative and recreate venv
-                        log_warning(f"Could not determine version of target Python ({python_executable})")
-                        log_warning("Cannot verify venv Python version compatibility - will recreate venv to be safe")
-                        venv_needs_recreation = True
-                        # Skip version comparison since we don't have valid data
-                        python_exec_major_minor = None
-                
-                # Check if versions match (major.minor) - only if we have valid version data
-                if python_exec_major_minor and venv_major_minor and venv_major_minor != python_exec_major_minor:
-                    log_warning(f"Parakeet venv Python version mismatch: venv has {venv_version}, target Python is {python_exec_version}")
-                    log_info("Recreating venv to match target Python version...")
-                    venv_needs_recreation = True
-            except Exception:
-                # If we can't check, assume it's fine
-                pass
-        else:
-            venv_needs_recreation = True
-    
-    # Recreate venv if needed
-    if venv_needs_recreation or not PARAKEET_VENV_DIR.exists():
-        if PARAKEET_VENV_DIR.exists():
-            log_info(f"Removing existing Parakeet venv at {PARAKEET_VENV_DIR}")
-            import shutil
-            shutil.rmtree(PARAKEET_VENV_DIR)
+    # Create venv with uv if it doesn't exist
+    if not PARAKEET_VENV_DIR.exists():
         log_info(f"Creating Parakeet venv at {PARAKEET_VENV_DIR}")
         PARAKEET_VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
-        run_command([python_executable, '-m', 'venv', str(PARAKEET_VENV_DIR)], check=True)
+        # Parakeet doesn't need system-site-packages
+        run_command(['uv', 'venv', str(PARAKEET_VENV_DIR)], check=True)
     else:
         log_info(f"Parakeet venv already exists at {PARAKEET_VENV_DIR}")
-    
-    # Get pip binary
-    pip_bin = PARAKEET_VENV_DIR / 'bin' / 'pip'
-    if not pip_bin.exists():
-        log_error(f"pip not found in Parakeet venv at {PARAKEET_VENV_DIR}")
-        raise FileNotFoundError(f"pip not found in Parakeet venv")
-    
-    # Upgrade pip and wheel (mise-free env applied automatically via run_command)
-    run_command([str(pip_bin), 'install', '--upgrade', 'pip', 'wheel'], check=True)
-    
-    return pip_bin
+
+    return PARAKEET_VENV_DIR
 
 
-def install_parakeet_dependencies(pip_bin: Path) -> bool:
+def install_parakeet_dependencies(venv_dir: Path) -> bool:
     """Install Parakeet backend dependencies"""
     log_info("Installing Parakeet dependencies...")
-    
+
+    venv_python = str(venv_dir / 'bin' / 'python')
+
     # Check for CUDA availability
     enable_cuda = False
     if shutil.which('nvidia-smi'):
@@ -1751,15 +1589,15 @@ def install_parakeet_dependencies(pip_bin: Path) -> bool:
                 log_info("CUDA detected - will install PyTorch with CUDA support")
         except Exception:
             pass
-    
-    try:
 
+    try:
         # Install ml_dtypes and numpy first with pinned versions to ensure compatibility
         # - ml_dtypes 0.5.4+ includes float4_e2m1fn required by onnx
         # - numpy must be <2.4 for numba compatibility (numba is a nemo_toolkit dep)
         log_info("Installing ml_dtypes and numpy (required for onnx/numba compatibility)...")
-        run_command([str(pip_bin), 'install', '--upgrade', 'ml_dtypes>=0.5.4', 'numpy>=1.22,<2.4'], check=True)
-       
+        run_command(['uv', 'pip', 'install', '--python', venv_python,
+                    '--upgrade', 'ml_dtypes>=0.5.4', 'numpy>=1.22,<2.4'], check=True)
+
         # Install base dependencies first (excluding torch)
         log_info("Installing base dependencies... May take a moment.")
         base_deps = [
@@ -1769,17 +1607,18 @@ def install_parakeet_dependencies(pip_bin: Path) -> bool:
             'soundfile',
             'python-multipart',
         ]
-        
+
         if enable_cuda:
             base_deps.append('cuda-python>=12.3')
-        
-        run_command([str(pip_bin), 'install'] + base_deps, check=True)
+
+        run_command(['uv', 'pip', 'install', '--python', venv_python] + base_deps, check=True)
 
         # Re-pin ml_dtypes and numpy after nemo_toolkit installation
         # nemo_toolkit's dependency resolution can downgrade ml_dtypes to 0.4.x
         # which lacks float4_e2m1fn required by onnx
         log_info("Re-pinning ml_dtypes and numpy versions...")
-        run_command([str(pip_bin), 'install', '--upgrade', 'ml_dtypes>=0.5.4', 'numpy>=1.22,<2.4'], check=True)
+        run_command(['uv', 'pip', 'install', '--python', venv_python,
+                    '--upgrade', 'ml_dtypes>=0.5.4', 'numpy>=1.22,<2.4'], check=True)
 
         # Install torch with appropriate CUDA support
         if enable_cuda:
@@ -1787,7 +1626,7 @@ def install_parakeet_dependencies(pip_bin: Path) -> bool:
             # Use PyTorch CUDA index
             try:
                 run_command([
-                    str(pip_bin), 'install', 'torch',
+                    'uv', 'pip', 'install', '--python', venv_python, 'torch',
                     '--index-url', 'https://download.pytorch.org/whl/cu121'
                 ], check=True)
                 log_success("PyTorch with CUDA support installed")
@@ -1795,12 +1634,12 @@ def install_parakeet_dependencies(pip_bin: Path) -> bool:
                 log_warning(f"PyTorch CUDA installation failed: {e}")
                 log_warning("Falling back to CPU-only PyTorch installation... GPU preferred but it works.")
                 log_info("Installing PyTorch (CPU-only)...")
-                run_command([str(pip_bin), 'install', 'torch'], check=True)
+                run_command(['uv', 'pip', 'install', '--python', venv_python, 'torch'], check=True)
                 log_success("PyTorch (CPU-only) installed as fallback")
         else:
             log_info("Installing PyTorch (CPU-only)...")
-            run_command([str(pip_bin), 'install', 'torch'], check=True)
-        
+            run_command(['uv', 'pip', 'install', '--python', venv_python, 'torch'], check=True)
+
         log_success("Parakeet dependencies installed")
         return True
     except subprocess.CalledProcessError as e:
@@ -1810,7 +1649,7 @@ def install_parakeet_dependencies(pip_bin: Path) -> bool:
 
 # ==================== ONNX-ASR Installation ====================
 
-def install_onnx_asr(pip_bin: Path, enable_gpu: bool = False) -> bool:
+def install_onnx_asr(venv_dir: Path, enable_gpu: bool = False) -> bool:
     """
     Install onnx-asr into the main venv.
 
@@ -1818,22 +1657,24 @@ def install_onnx_asr(pip_bin: Path, enable_gpu: bool = False) -> bool:
     It provides significantly better performance than whisper.cpp.
 
     Args:
-        pip_bin: Path to pip binary in the venv
+        venv_dir: Path to venv directory
         enable_gpu: If True, install GPU support (CUDA/TensorRT)
 
     Returns:
         True if installation succeeded, False otherwise
     """
+    venv_python = str(venv_dir / 'bin' / 'python')
+
     if enable_gpu:
         log_info("Installing onnx-asr with GPU support (CUDA/TensorRT)...")
         try:
             # Explicitly install onnxruntime-gpu first to ensure it's available
             log_info("Installing onnxruntime-gpu...")
-            run_command([str(pip_bin), 'install', 'onnxruntime-gpu'], check=True)
+            run_command(['uv', 'pip', 'install', '--python', venv_python, 'onnxruntime-gpu'], check=True)
             # Install onnx-asr with GPU backend and HuggingFace hub support
             # [cuda] = onnxruntime-gpu for CUDA/TensorRT (but we install it explicitly above)
             # [hub] = huggingface_hub for model downloads
-            run_command([str(pip_bin), 'install', 'onnx-asr[cuda,hub]'], check=True)
+            run_command(['uv', 'pip', 'install', '--python', venv_python, 'onnx-asr[cuda,hub]'], check=True)
             log_success("onnx-asr installed with GPU support")
             return True
         except subprocess.CalledProcessError as e:
@@ -1841,14 +1682,14 @@ def install_onnx_asr(pip_bin: Path, enable_gpu: bool = False) -> bool:
             log_warning("Falling back to CPU-only installation...")
             # Fall back to CPU installation
             enable_gpu = False
-    
+
     if not enable_gpu:
         log_info("Installing onnx-asr (CPU-optimized)...")
         try:
             # Install onnx-asr with CPU backend and HuggingFace hub support
             # [cpu] = onnxruntime for CPU
             # [hub] = huggingface_hub for model downloads
-            run_command([str(pip_bin), 'install', 'onnx-asr[cpu,hub]'], check=True)
+            run_command(['uv', 'pip', 'install', '--python', venv_python, 'onnx-asr[cpu,hub]'], check=True)
             log_success("onnx-asr installed")
             return True
         except subprocess.CalledProcessError as e:
@@ -1869,10 +1710,10 @@ def _parallel_setup_gpu_and_venv(backend_type: str, force_rebuild: bool = False)
         force_rebuild: If True, recreate venv even if it exists
 
     Returns:
-        Tuple of (gpu_status dict, pip_bin Path or None if venv setup failed)
+        Tuple of (gpu_status dict, venv_dir Path or None if venv setup failed)
     """
     gpu_status = {'cuda': False, 'rocm': False, 'vulkan': False}
-    pip_bin = None
+    venv_dir = None
     errors = []
 
     def setup_gpu():
@@ -1890,9 +1731,9 @@ def _parallel_setup_gpu_and_venv(backend_type: str, force_rebuild: bool = False)
 
     def setup_venv():
         """Create/verify Python venv"""
-        nonlocal pip_bin
+        nonlocal venv_dir
         try:
-            pip_bin = setup_python_venv(force_rebuild=force_rebuild)
+            venv_dir = setup_python_venv(force_rebuild=force_rebuild)
         except Exception as e:
             errors.append(f"Venv setup error: {e}")
 
@@ -1912,15 +1753,15 @@ def _parallel_setup_gpu_and_venv(backend_type: str, force_rebuild: bool = False)
         for error in errors:
             log_warning(error)
 
-    return gpu_status, pip_bin
+    return gpu_status, venv_dir
 
 
-def _parallel_deps_and_wheel(pip_bin: Path, requirements_file: Path, variant: str) -> Tuple[bool, Optional[Path]]:
+def _parallel_deps_and_wheel(venv_dir: Path, requirements_file: Path, variant: str) -> Tuple[bool, Optional[Path]]:
     """
     Download wheel and install base dependencies in parallel.
 
     Args:
-        pip_bin: Path to pip in venv
+        venv_dir: Path to venv directory
         requirements_file: Path to requirements.txt
         variant: Wheel variant ('cpu', 'cuda118', 'cuda122')
 
@@ -1930,6 +1771,7 @@ def _parallel_deps_and_wheel(pip_bin: Path, requirements_file: Path, variant: st
     deps_ok = False
     wheel_path = None
     errors = []
+    venv_python = str(venv_dir / 'bin' / 'python')
 
     def install_deps():
         """Install base dependencies (excluding pywhispercpp)"""
@@ -1943,7 +1785,8 @@ def _parallel_deps_and_wheel(pip_bin: Path, requirements_file: Path, variant: st
             temp_req_path = None
             try:
                 temp_req_path = _filter_requirements(requirements_file, skip_packages)
-                run_command([str(pip_bin), 'install', '-r', str(temp_req_path)], check=True)
+                run_command(['uv', 'pip', 'install', '--python', venv_python,
+                            '-r', str(temp_req_path)], check=True)
                 deps_ok = True
             finally:
                 if temp_req_path and temp_req_path.exists():
@@ -2048,24 +1891,24 @@ def install_backend(backend_type: str, cleanup_on_failure: bool = True, force_re
                 log_error(error_msg)
                 set_install_state('failed', error_msg)
                 return False
-            
+
             # Setup Parakeet venv
             parakeet_venv_existed = PARAKEET_VENV_DIR.exists()
-            parakeet_pip_bin = setup_parakeet_venv(force_rebuild=force_rebuild)
+            parakeet_venv_dir = setup_parakeet_venv(force_rebuild=force_rebuild)
             if (force_rebuild or not parakeet_venv_existed) and PARAKEET_VENV_DIR.exists():
                 created_items['venv_created'] = True
                 created_items['venv_path'] = str(PARAKEET_VENV_DIR)
-            
+
             # Install Parakeet dependencies
-            if not install_parakeet_dependencies(parakeet_pip_bin):
+            if not install_parakeet_dependencies(parakeet_venv_dir):
                 error_msg = "Failed to install Parakeet dependencies"
                 log_error(error_msg)
                 if cleanup_on_failure:
                     log_info("Cleaning up partial installation...")
-                    _cleanup_partial_installation(created_items, parakeet_pip_bin)
+                    _cleanup_partial_installation(created_items, parakeet_venv_dir)
                 set_install_state('failed', error_msg)
                 return False
-            
+
             # Installation successful for Parakeet
             set_install_state('completed')
             log_success("Parakeet backend installation completed!")
@@ -2074,10 +1917,12 @@ def install_backend(backend_type: str, cleanup_on_failure: bool = True, force_re
             # ONNX-ASR uses main venv with onnx-asr package
             # Setup main venv
             venv_existed = VENV_DIR.exists()
-            pip_bin = setup_python_venv(force_rebuild=force_rebuild)
+            venv_dir = setup_python_venv(force_rebuild=force_rebuild)
             if (force_rebuild or not venv_existed) and VENV_DIR.exists():
                 created_items['venv_created'] = True
                 created_items['venv_path'] = str(VENV_DIR)
+
+            venv_python = str(venv_dir / 'bin' / 'python')
 
             # Detect GPU availability for onnx-asr
             # Note: onnx-asr only needs NVIDIA drivers (nvidia-smi), not CUDA toolkit
@@ -2099,7 +1944,7 @@ def install_backend(backend_type: str, cleanup_on_failure: bool = True, force_re
                         log_info("NVIDIA driver check failed - will use CPU mode")
                 except Exception:
                     log_info("GPU detection failed - will use CPU mode")
-            
+
             if not enable_gpu:
                 log_info("Installing onnx-asr (CPU-optimized)")
 
@@ -2107,29 +1952,29 @@ def install_backend(backend_type: str, cleanup_on_failure: bool = True, force_re
             requirements_file = Path(HYPRWHSPR_ROOT) / 'requirements.txt'
             log_info("Installing base dependencies...")
             try:
-                run_command([str(pip_bin), 'install', '-r', str(requirements_file)], check=True)
+                run_command(['uv', 'pip', 'install', '--python', venv_python,
+                            '-r', str(requirements_file)], check=True)
             except subprocess.CalledProcessError as e:
                 error_msg = f"Failed to install base dependencies: {e}"
                 log_error(error_msg)
                 if cleanup_on_failure:
                     log_info("Cleaning up partial installation...")
-                    _cleanup_partial_installation(created_items, pip_bin)
+                    _cleanup_partial_installation(created_items, venv_dir)
                 set_install_state('failed', error_msg)
                 return False
 
             # Install onnx-asr on top (with GPU support if available)
-            if not install_onnx_asr(pip_bin, enable_gpu=enable_gpu):
+            if not install_onnx_asr(venv_dir, enable_gpu=enable_gpu):
                 error_msg = "Failed to install onnx-asr"
                 log_error(error_msg)
                 if cleanup_on_failure:
                     log_info("Cleaning up partial installation...")
-                    _cleanup_partial_installation(created_items, pip_bin)
+                    _cleanup_partial_installation(created_items, venv_dir)
                 set_install_state('failed', error_msg)
                 return False
 
             # Pre-download models so they're ready on first use
             log_info("Downloading ONNX-ASR model and VAD (this may take a moment)...")
-            venv_python = VENV_DIR / 'bin' / 'python'
             try:
                 # Download and cache the ASR model + Silero VAD
                 # This mirrors what happens at runtime but ensures everything is ready
@@ -2141,7 +1986,7 @@ print("Downloading Silero VAD...", flush=True)
 vad = onnx_asr.load_vad("silero")
 print("Models cached successfully", flush=True)
 '''
-                run_command([str(venv_python), '-c', download_script], check=True)
+                run_command([venv_python, '-c', download_script], check=True)
                 log_success("Models downloaded and cached")
             except subprocess.CalledProcessError as e:
                 log_warning(f"Model download failed: {e}")
@@ -2159,7 +2004,7 @@ print("Models cached successfully", flush=True)
 
         # Setup Python venv (for cpu/nvidia/amd backends)
         venv_existed = VENV_DIR.exists()
-        pip_bin = setup_python_venv(force_rebuild=force_rebuild)
+        venv_dir = setup_python_venv(force_rebuild=force_rebuild)
         if (force_rebuild or not venv_existed) and VENV_DIR.exists():
             created_items['venv_created'] = True
             created_items['venv_path'] = str(VENV_DIR)
@@ -2168,18 +2013,19 @@ print("Models cached successfully", flush=True)
         requirements_file = Path(HYPRWHSPR_ROOT) / 'requirements.txt'
         cur_req_hash = compute_file_hash(requirements_file)
         stored_req_hash = get_state("requirements_hash")
-        
+
+        venv_python = str(venv_dir / 'bin' / 'python')
+
         deps_installed = False
         try:
-            python_bin = VENV_DIR / 'bin' / 'python'
             result = run_command([
-                'timeout', '5s', str(python_bin), '-c',
+                'timeout', '5s', venv_python, '-c',
                 'import sounddevice, pywhispercpp'
             ], check=False, capture_output=True, show_output_on_error=False)
             deps_installed = result.returncode == 0
         except Exception:
             pass
-        
+
         # Install pywhispercpp if needed
         if cur_req_hash != stored_req_hash or not stored_req_hash or not deps_installed:
             if not stored_req_hash:
@@ -2220,7 +2066,8 @@ print("Models cached successfully", flush=True)
                         temp_req.flush()
 
                         if temp_req_path.stat().st_size > 0:
-                            run_command([str(pip_bin), 'install', '-r', str(temp_req_path)],
+                            run_command(['uv', 'pip', 'install', '--python', venv_python,
+                                        '-r', str(temp_req_path)],
                                        check=True, verbose=OutputController.get_verbosity().value >= VerbosityLevel.VERBOSE.value)
                     except Exception as e:
                         error_msg = f"Failed to install base Python dependencies: {e}"
@@ -2229,7 +2076,7 @@ print("Models cached successfully", flush=True)
                             log_info("Cleaning up partial installation...")
                             # Uninstall any partially installed packages
                             try:
-                                run_command([str(pip_bin), 'uninstall', '-y'] + created_items['packages_installed'], 
+                                run_command(['uv', 'pip', 'uninstall', '--python', venv_python] + created_items['packages_installed'],
                                           check=False, capture_output=True)
                             except Exception:
                                 pass
@@ -2239,26 +2086,26 @@ print("Models cached successfully", flush=True)
                         # Clean up temp file
                         if temp_req_path.exists():
                             temp_req_path.unlink()
-                
+
                 # Remove any pre-existing pywhispercpp
-                run_command([str(pip_bin), 'uninstall', '-y', 'pywhispercpp'], check=False, capture_output=True)
-                
+                run_command(['uv', 'pip', 'uninstall', '--python', venv_python, 'pywhispercpp'], check=False, capture_output=True)
+
                 # Build pywhispercpp with GPU support
                 if enable_cuda:
-                    if not install_pywhispercpp_cuda(pip_bin):
+                    if not install_pywhispercpp_cuda(venv_dir):
                         error_msg = "Failed to install pywhispercpp with CUDA support"
                         log_error(error_msg)
                         if cleanup_on_failure:
                             log_info("Cleaning up partial installation...")
                             try:
-                                run_command([str(pip_bin), 'uninstall', '-y', 'pywhispercpp'], 
+                                run_command(['uv', 'pip', 'uninstall', '--python', venv_python, 'pywhispercpp'],
                                           check=False, capture_output=True)
                             except Exception:
                                 pass
                         set_install_state('failed', error_msg)
                         return False
                 elif enable_rocm:
-                    success, should_fallback = install_pywhispercpp_rocm(pip_bin)
+                    success, should_fallback = install_pywhispercpp_rocm(venv_dir)
                     if not success:
                         if should_fallback:
                             # ROCm build failed - fall back to CPU-only
@@ -2272,7 +2119,7 @@ print("Models cached successfully", flush=True)
                             log_warning("  • Use REST API transcription backend (see README)")
                             log_warning("")
                             log_info("Installing pywhispercpp with CPU-only support...")
-                            if not install_pywhispercpp_cpu(pip_bin, requirements_file):
+                            if not install_pywhispercpp_cpu(venv_dir, requirements_file):
                                 error_msg = "Failed to install pywhispercpp (CPU-only fallback)"
                                 log_error(error_msg)
                                 set_install_state('failed', error_msg)
@@ -2284,18 +2131,18 @@ print("Models cached successfully", flush=True)
                             if cleanup_on_failure:
                                 log_info("Cleaning up partial installation...")
                                 try:
-                                    run_command([str(pip_bin), 'uninstall', '-y', 'pywhispercpp'],
+                                    run_command(['uv', 'pip', 'uninstall', '--python', venv_python, 'pywhispercpp'],
                                               check=False, capture_output=True)
                                 except Exception:
                                     pass
                             set_install_state('failed', error_msg)
                             return False
                 elif enable_vulkan:
-                    if not install_pywhispercpp_vulkan(pip_bin):
+                    if not install_pywhispercpp_vulkan(venv_dir):
                         # Vulkan build failed - fall back to CPU-only
                         log_warning("Vulkan build failed - falling back to CPU-only installation")
                         log_info("Installing pywhispercpp with CPU-only support...")
-                        if not install_pywhispercpp_cpu(pip_bin, requirements_file):
+                        if not install_pywhispercpp_cpu(venv_dir, requirements_file):
                             error_msg = "Failed to install pywhispercpp (CPU-only fallback)"
                             log_error(error_msg)
                             set_install_state('failed', error_msg)
@@ -2303,34 +2150,34 @@ print("Models cached successfully", flush=True)
                         log_success("pywhispercpp installed (CPU-only mode)")
             else:
                 # CPU-only path: install everything normally
-                if not install_pywhispercpp_cpu(pip_bin, requirements_file):
+                if not install_pywhispercpp_cpu(venv_dir, requirements_file):
                     error_msg = "Failed to install pywhispercpp (CPU-only)"
                     log_error(error_msg)
                     set_install_state('failed', error_msg)
                     return False
-            
+
             set_state("requirements_hash", cur_req_hash)
             log_success("Python dependencies installed")
         else:
-            log_info("Python dependencies up to date (skipping pip install)")
-        
+            log_info("Python dependencies up to date (skipping uv pip install)")
+
         # Download base model
         if not download_pywhispercpp_model('base'):
             log_warning("Model download failed, but backend installation succeeded")
             # Don't fail the whole installation if model download fails
-        
+
         # Installation successful
         set_install_state('completed')
         log_success(f"{backend_type.upper()} backend installation completed!")
         return True
-        
+
     except KeyboardInterrupt:
         error_msg = "Installation interrupted by user"
         log_error(error_msg)
         set_install_state('failed', error_msg)
         if cleanup_on_failure:
             log_info("Cleaning up partial installation...")
-            _cleanup_partial_installation(created_items, pip_bin if 'pip_bin' in locals() else None)
+            _cleanup_partial_installation(created_items, venv_dir if 'venv_dir' in locals() else None)
         raise
     except Exception as e:
         error_msg = f"Unexpected error during installation: {e}"
@@ -2339,11 +2186,11 @@ print("Models cached successfully", flush=True)
         set_install_state('failed', error_msg)
         if cleanup_on_failure:
             log_info("Cleaning up partial installation...")
-            _cleanup_partial_installation(created_items, pip_bin if 'pip_bin' in locals() else None)
+            _cleanup_partial_installation(created_items, venv_dir if 'venv_dir' in locals() else None)
         return False
 
 
-def _cleanup_partial_installation(created_items: dict, pip_bin: Optional[Path]):
+def _cleanup_partial_installation(created_items: dict, venv_dir: Optional[Path]):
     """Clean up partial installation on failure"""
     if created_items.get('venv_created') and created_items.get('venv_path'):
         log_info(f"Removing venv at {created_items['venv_path']}")
@@ -2361,10 +2208,11 @@ def _cleanup_partial_installation(created_items: dict, pip_bin: Optional[Path]):
         except Exception:
             pass
     
-    if pip_bin and created_items.get('packages_installed'):
+    if venv_dir and created_items.get('packages_installed'):
         log_info("Uninstalling partially installed packages...")
         try:
-            run_command([str(pip_bin), 'uninstall', '-y'] + created_items['packages_installed'],
+            venv_python = str(venv_dir / 'bin' / 'python')
+            run_command(['uv', 'pip', 'uninstall', '--python', venv_python] + created_items['packages_installed'],
                        check=False, capture_output=True)
         except Exception:
             pass
