@@ -27,4 +27,4 @@ if [ -d "/opt/rocm" ]; then
 fi
 
 # Delegate to uv run
-exec uv run --project "$PACKAGE_ROOT" python -m cli "$@"
+exec uv run --project "$PACKAGE_ROOT" python -m lib.cli "$@"

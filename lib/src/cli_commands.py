@@ -310,13 +310,42 @@ def _load_jsonc(path: Path):
     return json.loads(stripped)
 
 
+def _find_project_root() -> Path:
+    """Find the project root directory.
+
+    Checks in order:
+    1. HYPRWHSPR_ROOT if it exists
+    2. Current working directory if it contains pyproject.toml
+    3. Directory containing this module (for development)
+
+    Returns:
+        Path to project root
+    """
+    # Check HYPRWHSPR_ROOT first
+    if Path(HYPRWHSPR_ROOT).exists():
+        return Path(HYPRWHSPR_ROOT)
+
+    # Check current working directory (common for development with uv run)
+    cwd = Path.cwd()
+    if cwd.joinpath('pyproject.toml').exists():
+        return cwd
+
+    # Check relative to this module's location
+    module_dir = Path(__file__).parent.parent.parent  # lib/src -> lib -> project root
+    if module_dir.joinpath('pyproject.toml').exists():
+        return module_dir
+
+    # Fall back to HYPRWHSPR_ROOT even if it doesn't exist
+    return Path(HYPRWHSPR_ROOT)
+
+
 def _validate_hyprwhspr_root() -> bool:
-    """Validate that HYPRWHSPR_ROOT exists and contains expected files"""
-    root_path = Path(HYPRWHSPR_ROOT)
+    """Validate that project root exists and contains expected files"""
+    root_path = _find_project_root()
     is_development = root_path != Path('/usr/lib/hyprwhspr')
-    
+
     if not root_path.exists():
-        log_error(f"HYPRWHSPR_ROOT does not exist: {HYPRWHSPR_ROOT}")
+        log_error(f"Project root does not exist: {root_path}")
         log_error("")
         if is_development:
             log_error("Development installation detected (not /usr/lib/hyprwhspr)")
@@ -329,36 +358,37 @@ def _validate_hyprwhspr_root() -> bool:
             log_error("Try reinstalling: yay -S hyprwhspr")
         log_error("")
         return False
-    
-    # Check for expected files
-    required_files = [
-        root_path / 'bin' / 'hyprwhspr',
-        root_path / 'lib' / 'main.py',
-    ]
-    
+
+    # For development, check for pyproject.toml instead of bin/hyprwhspr
+    if is_development:
+        required_files = [
+            root_path / 'pyproject.toml',
+            root_path / 'lib' / 'src' / 'cli_commands.py',
+        ]
+    else:
+        required_files = [
+            root_path / 'bin' / 'hyprwhspr',
+            root_path / 'lib' / 'main.py',
+        ]
+
     missing_files = []
     for file_path in required_files:
         if not file_path.exists():
             missing_files.append(str(file_path.relative_to(root_path)))
-    
+
     if missing_files:
-        log_error(f"HYPRWHSPR_ROOT is missing required files: {', '.join(missing_files)}")
-        log_error(f"Root path: {HYPRWHSPR_ROOT}")
+        log_error(f"Project root is missing required files: {', '.join(missing_files)}")
+        log_error(f"Root path: {root_path}")
         log_error("")
         if is_development:
-            log_error("Development installation detected (not /usr/lib/hyprwhspr)")
-            log_error("This may be a development installation issue.")
+            log_error("Development installation detected.")
             log_error("Ensure you're running from the repository root.")
-            log_error("")
-            log_error("Expected structure:")
-            log_error(f"  {root_path}/bin/hyprwhspr")
-            log_error(f"  {root_path}/lib/main.py")
         else:
             log_error("This appears to be a corrupted AUR installation.")
             log_error("Try reinstalling: yay -S hyprwhspr")
         log_error("")
         return False
-    
+
     return True
 
 
@@ -1248,22 +1278,21 @@ def setup_command():
         print("Python Environment Setup")
         print("="*60)
         log_info("Ensuring Python virtual environment and dependencies are installed...")
-        
+
         try:
-            from .backend_installer import setup_python_venv, compute_file_hash, get_state, set_state, HYPRWHSPR_ROOT
+            from .backend_installer import setup_python_venv, sync_dependencies, compute_file_hash, get_state, set_state, get_uv_lock_file
             from .output_control import run_command
         except ImportError:
-            from backend_installer import setup_python_venv, compute_file_hash, get_state, set_state, HYPRWHSPR_ROOT
+            from backend_installer import setup_python_venv, sync_dependencies, compute_file_hash, get_state, set_state, get_uv_lock_file
             from output_control import run_command
-        
+
         # Setup venv (creates if needed, updates if exists)
-        pip_bin = setup_python_venv()
-        
-        # Check if requirements.txt has changed
-        requirements_file = Path(HYPRWHSPR_ROOT) / 'requirements.txt'
-        cur_req_hash = compute_file_hash(requirements_file)
-        stored_req_hash = get_state("requirements_hash")
-        
+        venv_dir = setup_python_venv()
+
+        # Check if uv.lock has changed
+        cur_lock_hash = compute_file_hash(get_uv_lock_file())
+        stored_lock_hash = get_state("uv_lock_hash")
+
         # Check if base dependencies are installed (excluding pywhispercpp)
         deps_installed = False
         try:
@@ -1275,45 +1304,25 @@ def setup_command():
             deps_installed = result.returncode == 0
         except Exception:
             pass
-        
+
         # Install base dependencies if needed (excluding pywhispercpp)
-        if cur_req_hash != stored_req_hash or not stored_req_hash or not deps_installed:
-            if not stored_req_hash:
+        if cur_lock_hash != stored_lock_hash or not stored_lock_hash or not deps_installed:
+            if not stored_lock_hash:
                 # First time setup - no stored hash means venv is new
                 log_info("Installing base Python dependencies (excluding pywhispercpp)...")
-            elif cur_req_hash != stored_req_hash:
-                # Requirements actually changed
-                log_info("Requirements.txt has changed. Updating base Python dependencies...")
+            elif cur_lock_hash != stored_lock_hash:
+                # Lockfile changed
+                log_info("Lockfile changed. Updating base Python dependencies...")
             else:
                 # Dependencies missing but hash matches (shouldn't happen often)
                 log_info("Installing missing base Python dependencies...")
-            
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as temp_req:
-                temp_req_path = Path(temp_req.name)
-                try:
-                    with open(requirements_file, 'r', encoding='utf-8') as f_in:
-                        for line in f_in:
-                            # Skip pywhispercpp - not needed for cloud backends
-                            if not line.strip().startswith('pywhispercpp'):
-                                temp_req.write(line)
-                    
-                    temp_req.flush()
-                    
-                    if temp_req_path.stat().st_size > 0:
-                        run_command([str(pip_bin), 'install', '-r', str(temp_req_path)], check=True)
-                    else:
-                        log_warning("No dependencies to install (all excluded)")
-                except Exception as e:
-                    log_error(f"Failed to install base dependencies: {e}")
-                    log_warning("Continuing anyway - dependencies may be missing")
-                finally:
-                    # Clean up temp file
-                    if temp_req_path.exists():
-                        temp_req_path.unlink()
-            
-            set_state("requirements_hash", cur_req_hash)
-            log_success("Base Python dependencies installed")
+
+            if sync_dependencies(venv_dir, exclude_packages=['pywhispercpp']):
+                set_state("uv_lock_hash", cur_lock_hash)
+                log_success("Base Python dependencies installed")
+            else:
+                log_error("Failed to install base dependencies")
+                log_warning("Continuing anyway - dependencies may be missing")
         else:
             log_info("Base Python dependencies up to date")
     
@@ -2247,36 +2256,68 @@ def systemd_command(action: str):
 def setup_systemd(mode: str = 'install'):
     """Setup systemd user service"""
     log_info("Configuring systemd user services...")
-    
-    # Validate HYPRWHSPR_ROOT
+
+    # Validate project root
     if not _validate_hyprwhspr_root():
         return False
-    
-    # Validate main executable exists
-    main_exec = Path(HYPRWHSPR_ROOT) / 'bin' / 'hyprwhspr'
-    if not main_exec.exists() or not os.access(main_exec, os.X_OK):
-        log_error(f"Main executable not found or not executable: {main_exec}")
-        return False
-    
+
+    root_path = _find_project_root()
+    is_development = root_path != Path('/usr/lib/hyprwhspr')
+
+    # For development mode, check if we can find the service file
+    service_source = root_path / 'config' / 'systemd' / SERVICE_NAME
+    if not service_source.exists():
+        if is_development:
+            log_warning("Systemd service template not found in development environment")
+            log_warning(f"Expected at: {service_source}")
+            log_warning("Skipping systemd service setup (run from installed package for systemd support)")
+            return True  # Don't fail, just skip
+        else:
+            log_error(f"Service file not found: {service_source}")
+            return False
+
+    # Validate main executable exists (only for installed mode)
+    if not is_development:
+        main_exec = root_path / 'bin' / 'hyprwhspr'
+        if not main_exec.exists() or not os.access(main_exec, os.X_OK):
+            log_error(f"Main executable not found or not executable: {main_exec}")
+            return False
+
     # Create user systemd directory
     USER_SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Read hyprwhspr service file template and substitute paths
-    service_source = Path(HYPRWHSPR_ROOT) / 'config' / 'systemd' / SERVICE_NAME
+
     service_dest = USER_SYSTEMD_DIR / SERVICE_NAME
-    
-    if not service_source.exists():
-        log_error(f"Service file not found: {service_source}")
-        return False
-    
-    # Read template and substitute HYPRWHSPR_ROOT
+
+    # Read template and substitute paths
     try:
         with open(service_source, 'r', encoding='utf-8') as f:
             service_content = f.read()
-        
-        # Substitute hardcoded path with actual HYPRWHSPR_ROOT
-        service_content = service_content.replace('/usr/lib/hyprwhspr', HYPRWHSPR_ROOT)
-        
+
+        # Substitute hardcoded path with actual project root
+        service_content = service_content.replace('/usr/lib/hyprwhspr', str(root_path))
+
+        # For onnx-asr backend, use the backend venv Python since onnxruntime-gpu
+        # may not have wheels for the current Python version
+        config = ConfigManager()
+        current_backend = config.get_setting('transcription_backend', 'pywhispercpp')
+        current_backend = normalize_backend(current_backend)
+
+        if current_backend == 'onnx-asr':
+            venv_python = VENV_DIR / 'bin' / 'python'
+            if venv_python.exists():
+                # Replace uv run command with direct venv python execution
+                old_exec = f'/usr/bin/env uv run --project {root_path} python -m lib.main'
+                new_exec = f'{venv_python} -m lib.main'
+                service_content = service_content.replace(old_exec, new_exec)
+
+                # Also add PYTHONPATH to ensure cli module is found
+                pythonpath_line = f'Environment=PYTHONPATH={root_path}/lib'
+                service_content = service_content.replace(
+                    'Environment=PYTHONUNBUFFERED=1',
+                    f'{pythonpath_line}\nEnvironment=PYTHONUNBUFFERED=1'
+                )
+                log_info(f"Configured service to use backend venv Python for onnx-asr")
+
         # Write substituted content to user directory
         with open(service_dest, 'w', encoding='utf-8') as f:
             f.write(service_content)
@@ -3280,27 +3321,36 @@ def state_reset_command(remove_all: bool = False):
 def validate_command():
     """Validate installation"""
     log_info("Validating installation...")
-    
+
     all_ok = True
-    
-    # Validate HYPRWHSPR_ROOT first
+
+    # Validate project root first
     if not _validate_hyprwhspr_root():
         all_ok = False
         return all_ok
-    
+
+    root_path = _find_project_root()
+    is_development = root_path != Path('/usr/lib/hyprwhspr')
+
     # Detect current backend to determine what to validate
     current_backend = _detect_current_backend()
     is_rest_api = current_backend in ['rest-api', 'parakeet', 'remote', 'realtime-ws']
     is_onnx_asr = current_backend == 'onnx-asr'
     is_pywhispercpp = current_backend in ['cpu', 'nvidia', 'amd', 'vulkan', 'pywhispercpp']
-    
-    # Check static files
-    required_files = [
-        Path(HYPRWHSPR_ROOT) / 'bin' / 'hyprwhspr',
-        Path(HYPRWHSPR_ROOT) / 'lib' / 'main.py',
-        Path(HYPRWHSPR_ROOT) / 'config' / 'systemd' / SERVICE_NAME,
-    ]
-    
+
+    # Check static files (different requirements for dev vs installed)
+    if is_development:
+        required_files = [
+            root_path / 'pyproject.toml',
+            root_path / 'lib' / 'src' / 'cli_commands.py',
+        ]
+    else:
+        required_files = [
+            root_path / 'bin' / 'hyprwhspr',
+            root_path / 'lib' / 'main.py',
+            root_path / 'config' / 'systemd' / SERVICE_NAME,
+        ]
+
     for file_path in required_files:
         if file_path.exists():
             log_success(f"✓ {file_path.name} exists")
@@ -3627,12 +3677,37 @@ def test_command(live: bool = False, mic_only: bool = False):
 
     elif backend == 'onnx-asr':
         # Test ONNX-ASR model availability
-        try:
-            import onnx_asr
+        # Check in venv first (where backend installer puts it)
+        venv_python = VENV_DIR / 'bin' / 'python'
+        onnx_asr_available = False
+
+        if venv_python.exists():
+            try:
+                result = subprocess.run(
+                    [str(venv_python), '-c', 'import onnx_asr'],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    onnx_asr_available = True
+            except Exception:
+                pass
+
+        # Fallback: check in current environment
+        if not onnx_asr_available:
+            try:
+                import onnx_asr  # noqa: F401
+                onnx_asr_available = True
+            except ImportError:
+                pass
+
+        if onnx_asr_available:
             model_name = config.get_setting('onnx_asr_model', 'nemo-parakeet-tdt-0.6b-v3')
             log_success(f"onnx-asr available, model: {model_name}")
             backend_ready = True
-        except ImportError:
+        else:
             log_error("onnx-asr not installed")
             all_passed = False
 
@@ -3705,8 +3780,9 @@ def test_command(live: bool = False, mic_only: bool = False):
                 log_error("Cannot record - audio capture not available")
                 all_passed = False
         else:
-            # Use test.wav
-            test_wav_path = Path(HYPRWHSPR_ROOT) / 'share' / 'assets' / 'test.wav'
+            # Use test.wav - check project root first
+            root_path = _find_project_root()
+            test_wav_path = root_path / 'share' / 'assets' / 'test.wav'
 
             if not test_wav_path.exists():
                 log_error(f"Test audio file not found: {test_wav_path}")
@@ -3744,57 +3820,168 @@ def test_command(live: bool = False, mic_only: bool = False):
 
         # Transcribe if we have audio
         if audio_data is not None and len(audio_data) > 0:
-            try:
-                from .whisper_manager import WhisperManager
-            except ImportError:
-                from whisper_manager import WhisperManager
+            # For onnx-asr, try using the backend venv Python since onnxruntime-gpu
+            # may not have wheels for the current Python version
+            use_subprocess = False
+            venv_python = VENV_DIR / 'bin' / 'python'
 
-            try:
-                log_info("Initializing backend...")
-                whisper = WhisperManager(config_manager=config)
-
-                if not whisper.initialize():
-                    log_error("Failed to initialize transcription backend")
-                    all_passed = False
-                else:
-                    duration = len(audio_data) / 16000
-                    if duration > 5:
-                        log_info(f"Transcribing {duration:.0f}s of audio (this may take a moment)...")
+            if backend == 'onnx-asr':
+                try:
+                    import onnx_asr  # noqa: F401
+                except ImportError:
+                    # onnx-asr not available in current Python, use subprocess
+                    if venv_python.exists():
+                        use_subprocess = True
                     else:
-                        log_info("Transcribing...")
+                        log_error("onnx-asr not available and backend venv not found")
+                        all_passed = False
 
-                    # For realtime-ws, we need to handle differently
-                    if backend == 'realtime-ws':
-                        # Realtime requires streaming - not ideal for test
-                        # Just verify connection worked during initialize()
-                        log_success("WebSocket connected successfully")
-                        log_info("(Realtime transcription requires streaming audio)")
-                        whisper.cleanup()
-                    else:
-                        result = whisper.transcribe_audio(audio_data)
+            if use_subprocess and backend == 'onnx-asr':
+                # Run transcription test via subprocess using venv Python
+                log_info("Initializing backend via subprocess...")
+                log_info("(Using backend venv for onnxruntime compatibility)")
 
-                        if result:
-                            # Clean up the result for display
-                            result_clean = result.strip()
-                            if result_clean:
-                                log_success("Transcription successful")
-                                print(f"  -> \"{result_clean}\"")
-                            else:
-                                log_warning("Transcription returned empty result")
-                                log_info("This may be normal if audio was silence")
-                        else:
+                # Save audio to temp file for subprocess
+                import tempfile
+                import numpy as np
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+                    tmp_path = tmp.name
+                    with wave.open(tmp_path, 'wb') as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(16000)
+                        audio_int16 = (audio_data * 32767).astype(np.int16)
+                        wf.writeframes(audio_int16.tobytes())
+
+                try:
+                    # Run transcription in subprocess
+                    root_path = _find_project_root()
+                    env = os.environ.copy()
+                    env['PYTHONPATH'] = str(root_path / 'lib')
+
+                    result = subprocess.run(
+                        [str(venv_python), '-c', f'''
+import sys
+sys.path.insert(0, "{root_path / 'lib'}")
+from src.whisper_manager import WhisperManager
+from src.config_manager import ConfigManager
+import numpy as np
+import wave
+
+config = ConfigManager()
+whisper = WhisperManager(config_manager=config)
+if not whisper.initialize():
+    print("INIT_FAILED")
+    sys.exit(1)
+
+with wave.open("{tmp_path}", "rb") as wf:
+    frames = wf.readframes(wf.getnframes())
+    audio_data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
+result = whisper.transcribe_audio(audio_data)
+if result:
+    print("RESULT:" + result.strip())
+else:
+    print("NO_RESULT")
+whisper.cleanup()
+'''],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        env=env
+                    )
+
+                    if result.returncode == 0:
+                        output = result.stdout.strip()
+                        # Find the RESULT: line in the output
+                        transcription = None
+                        for line in output.split('\n'):
+                            if line.startswith("RESULT:"):
+                                transcription = line[7:]
+                                break
+
+                        if transcription:
+                            log_success("Transcription successful")
+                            # Truncate long results for display
+                            display_text = transcription[:200] + "..." if len(transcription) > 200 else transcription
+                            print(f"  -> \"{display_text}\"")
+                        elif "INIT_FAILED" in output:
+                            log_error("Failed to initialize transcription backend")
+                            all_passed = False
+                        elif "NO_RESULT" in output:
                             log_error("Transcription returned no result")
                             all_passed = False
+                        else:
+                            # No RESULT line found - might be an issue
+                            log_warning("Transcription completed but no result captured")
+                    else:
+                        log_error(f"Subprocess transcription failed")
+                        if result.stderr:
+                            print(f"  Error: {result.stderr[:500]}")
+                        all_passed = False
 
-                        # Cleanup
-                        if hasattr(whisper, 'cleanup'):
+                except subprocess.TimeoutExpired:
+                    log_error("Transcription timed out")
+                    all_passed = False
+                finally:
+                    # Clean up temp file
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+            else:
+                # Standard in-process transcription
+                try:
+                    from .whisper_manager import WhisperManager
+                except ImportError:
+                    from whisper_manager import WhisperManager
+
+                try:
+                    log_info("Initializing backend...")
+                    whisper = WhisperManager(config_manager=config)
+
+                    if not whisper.initialize():
+                        log_error("Failed to initialize transcription backend")
+                        all_passed = False
+                    else:
+                        duration = len(audio_data) / 16000
+                        if duration > 5:
+                            log_info(f"Transcribing {duration:.0f}s of audio (this may take a moment)...")
+                        else:
+                            log_info("Transcribing...")
+
+                        # For realtime-ws, we need to handle differently
+                        if backend == 'realtime-ws':
+                            # Realtime requires streaming - not ideal for test
+                            # Just verify connection worked during initialize()
+                            log_success("WebSocket connected successfully")
+                            log_info("(Realtime transcription requires streaming audio)")
                             whisper.cleanup()
+                        else:
+                            result = whisper.transcribe_audio(audio_data)
 
-            except Exception as e:
-                log_error(f"Transcription test failed: {e}")
-                import traceback
-                traceback.print_exc()
-                all_passed = False
+                            if result:
+                                # Clean up the result for display
+                                result_clean = result.strip()
+                                if result_clean:
+                                    log_success("Transcription successful")
+                                    print(f"  -> \"{result_clean}\"")
+                                else:
+                                    log_warning("Transcription returned empty result")
+                                    log_info("This may be normal if audio was silence")
+                            else:
+                                log_error("Transcription returned no result")
+                                all_passed = False
+
+                            # Cleanup
+                            if hasattr(whisper, 'cleanup'):
+                                whisper.cleanup()
+
+                except Exception as e:
+                    log_error(f"Transcription test failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    all_passed = False
 
     # ===== SUMMARY =====
     print("\n" + "-"*60)

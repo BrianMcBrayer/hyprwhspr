@@ -68,7 +68,6 @@ PYWHISPERCPP_PINNED_COMMIT = "4ab96165f84e8eb579077dfc3d0476fa5606affe"
 PARAKEET_VENV_DIR = USER_BASE / 'parakeet-venv'
 PARAKEET_DIR = Path(HYPRWHSPR_ROOT) / 'lib' / 'backends' / 'parakeet'
 PARAKEET_SCRIPT = PARAKEET_DIR / 'parakeet-tdt-0.6b-v3.py'
-PARAKEET_REQUIREMENTS = PARAKEET_DIR / 'requirements.txt'
 
 # Pre-built wheel configuration
 WHEEL_BASE_URL = "https://github.com/goodroot/hyprwhspr/releases/download/wheels-v1"
@@ -1008,12 +1007,6 @@ def setup_python_venv(force_rebuild: bool = False) -> Path:
     """
     log_info("Setting up Python virtual environment…")
 
-    # Validate requirements.txt exists
-    requirements_file = Path(HYPRWHSPR_ROOT) / 'requirements.txt'
-    if not requirements_file.exists():
-        log_error(f"requirements.txt not found at {requirements_file}")
-        raise FileNotFoundError(f"requirements.txt not found at {requirements_file}")
-
     # Force rebuild if requested
     if force_rebuild and VENV_DIR.exists():
         log_info(f"Force rebuild requested - removing existing venv at {VENV_DIR}")
@@ -1035,126 +1028,103 @@ def setup_python_venv(force_rebuild: bool = False) -> Path:
     return VENV_DIR
 
 
-# ==================== pywhispercpp Installation ====================
+def _find_project_root() -> str:
+    """Find the project root directory containing pyproject.toml.
 
-def _should_skip_pygobject() -> bool:
-    """Check if PyGObject should be skipped (already installed as system package)."""
+    Checks in order:
+    1. HYPRWHSPR_ROOT if it contains pyproject.toml
+    2. Current working directory if it contains pyproject.toml
+    3. Directory containing this module (for development)
+
+    Returns:
+        Path to project root as string
+    """
+    # Check HYPRWHSPR_ROOT first
+    if Path(HYPRWHSPR_ROOT).joinpath('pyproject.toml').exists():
+        return HYPRWHSPR_ROOT
+
+    # Check current working directory (common for development with uv run)
+    cwd = Path.cwd()
+    if cwd.joinpath('pyproject.toml').exists():
+        return str(cwd)
+
+    # Check relative to this module's location
+    module_dir = Path(__file__).parent.parent.parent  # lib/src -> lib -> project root
+    if module_dir.joinpath('pyproject.toml').exists():
+        return str(module_dir)
+
+    # Fall back to HYPRWHSPR_ROOT even if pyproject.toml doesn't exist
+    return HYPRWHSPR_ROOT
+
+
+def get_uv_lock_file() -> Path:
+    """Get the path to uv.lock file in the project root."""
+    return Path(_find_project_root()) / 'uv.lock'
+
+
+def sync_dependencies(venv_dir: Path, exclude_packages: list = None) -> bool:
+    """Install dependencies from pyproject.toml using uv sync.
+
+    Args:
+        venv_dir: Path to the virtual environment
+        exclude_packages: List of package names to exclude from installation
+
+    Returns:
+        True if successful, False otherwise
+    """
+    log_info("Syncing dependencies from pyproject.toml...")
+
+    project_root = _find_project_root()
+    env = os.environ.copy()
+    env['UV_PROJECT_ENVIRONMENT'] = str(venv_dir)
+
+    cmd = [
+        'uv', 'sync',
+        '--directory', project_root,
+        '--no-install-project',  # Don't install hyprwhspr itself
+        '--frozen',  # Use lockfile exactly, don't update it
+    ]
+
+    # Add package exclusions if specified
+    if exclude_packages:
+        for pkg in exclude_packages:
+            cmd.extend(['--no-install-package', pkg])
+
     try:
-        import gi
-        # gi module exists - PyGObject is installed via system package
-        log_info("PyGObject already available (system package), skipping pip install")
+        run_command(cmd, check=True, env=env)
         return True
-    except ImportError:
+    except subprocess.CalledProcessError as e:
+        log_error(f"Failed to sync dependencies: {e}")
         return False
 
 
-def _extract_package_name(requirement_line: str) -> str:
-    """
-    Extract the package name from a requirements.txt line.
-    Handles version specifiers, extras, environment markers, and URL specs.
-    Examples:
-        'package>=1.0' -> 'package'
-        'package[extra]>=1.0' -> 'package'
-        'package>=1.0; python_version >= "3.8"' -> 'package'
-        'package @ https://...' -> 'package'
-    """
-    import re
-    line = requirement_line.strip().lower()
-    # Match package name: everything before version specifiers, extras, markers, or URL
-    match = re.match(r'^([a-z0-9][-a-z0-9_.]*)', line)
-    return match.group(1) if match else ''
+# ==================== pywhispercpp Installation ====================
 
-
-def _filter_requirements(requirements_file: Path, skip_packages: list) -> Path:
-    """
-    Create a filtered requirements file, skipping specified packages.
-    Returns path to temp file (caller must clean up).
-    """
-    import tempfile
-    skip_packages_lower = [pkg.lower() for pkg in skip_packages]
-    temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
-    try:
-        with open(requirements_file, 'r', encoding='utf-8') as f_in:
-            for line in f_in:
-                line_stripped = line.strip()
-                # Skip empty lines/comments as-is
-                if not line_stripped or line_stripped.startswith('#'):
-                    temp_file.write(line)
-                    continue
-                # Extract package name and check for exact match
-                pkg_name = _extract_package_name(line_stripped)
-                if pkg_name not in skip_packages_lower:
-                    temp_file.write(line)
-        temp_file.close()
-        return Path(temp_file.name)
-    except Exception:
-        temp_file.close()
-        # Clean up the temp file on error
-        try:
-            Path(temp_file.name).unlink()
-        except Exception:
-            pass
-        raise
-
-
-def install_pywhispercpp_cpu(venv_dir: Path, requirements_file: Path) -> bool:
-    """Install CPU-only pywhispercpp"""
+def install_pywhispercpp_cpu(venv_dir: Path) -> bool:
+    """Install CPU-only pywhispercpp and dependencies using uv sync"""
     log_info("Installing pywhispercpp (CPU-only)...")
 
-    venv_python = str(venv_dir / 'bin' / 'python')
-
-    # Track if wheel was successfully installed (to avoid overwriting with PyPI version)
-    wheel_installed = False
-
-    # Try pre-built wheel first (faster than pip resolving from PyPI)
+    # Try pre-built wheel first (faster than resolving from PyPI)
     wheel_path = download_pywhispercpp_wheel(variant='cpu')
     if wheel_path:
         if install_pywhispercpp_from_wheel(venv_dir, wheel_path):
-            wheel_installed = True
-            # Still need to install other requirements
-            skip_packages = ['pywhispercpp']
-            if _should_skip_pygobject():
-                skip_packages.append('PyGObject')
-            temp_req_path = None
-            try:
-                temp_req_path = _filter_requirements(requirements_file, skip_packages)
-                run_command(['uv', 'pip', 'install', '--python', venv_python,
-                            '-r', str(temp_req_path)], check=True)
+            # Wheel installed successfully, sync remaining deps excluding pywhispercpp
+            if sync_dependencies(venv_dir, exclude_packages=['pywhispercpp']):
+                log_success("pywhispercpp installed (CPU-only mode) from pre-built wheel")
                 return True
-            except subprocess.CalledProcessError as e:
-                log_warning(f"Wheel installed but remaining deps failed: {e}")
-                log_warning("Falling back to full uv pip install...")
-            finally:
-                if temp_req_path and temp_req_path.exists():
-                    temp_req_path.unlink()
+            else:
+                log_warning("Wheel installed but remaining deps failed")
+                return False
         else:
-            log_warning("Pre-built wheel failed, falling back to uv pip install...")
+            log_warning("Pre-built wheel failed, falling back to uv sync...")
 
-    # Build skip list - always skip pywhispercpp if wheel was already installed
-    skip_packages = []
-    if wheel_installed:
-        skip_packages.append('pywhispercpp')
-    if _should_skip_pygobject():
-        skip_packages.append('PyGObject')
-
-    temp_req_path = None
-    try:
-        if skip_packages:
-            temp_req_path = _filter_requirements(requirements_file, skip_packages)
-            install_file = temp_req_path
-        else:
-            install_file = requirements_file
-
-        run_command(['uv', 'pip', 'install', '--python', venv_python,
-                    '-r', str(install_file)], check=True)
+    # Sync all dependencies including pywhispercpp from PyPI
+    if sync_dependencies(venv_dir):
         log_success("pywhispercpp installed (CPU-only mode)")
         return True
-    except subprocess.CalledProcessError as e:
-        log_error(f"Failed to install pywhispercpp (CPU-only): {e}")
+    else:
+        log_error("Failed to install pywhispercpp (CPU-only)")
         return False
-    finally:
-        if temp_req_path and temp_req_path.exists():
-            temp_req_path.unlink()
 
 
 def install_pywhispercpp_cuda(venv_dir: Path) -> bool:
@@ -1551,11 +1521,6 @@ def setup_parakeet_venv(force_rebuild: bool = False) -> Path:
     """
     log_info("Setting up Parakeet Python virtual environment…")
 
-    # Validate requirements.txt exists
-    if not PARAKEET_REQUIREMENTS.exists():
-        log_error(f"Parakeet requirements.txt not found at {PARAKEET_REQUIREMENTS}")
-        raise FileNotFoundError(f"Parakeet requirements.txt not found at {PARAKEET_REQUIREMENTS}")
-
     # Force rebuild if requested
     if force_rebuild and PARAKEET_VENV_DIR.exists():
         log_info(f"Force rebuild requested - removing existing Parakeet venv at {PARAKEET_VENV_DIR}")
@@ -1649,6 +1614,32 @@ def install_parakeet_dependencies(venv_dir: Path) -> bool:
 
 # ==================== ONNX-ASR Installation ====================
 
+def _detect_cuda_major_version() -> Optional[int]:
+    """Detect the major CUDA version from nvidia-smi."""
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=driver_version', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=5, check=False
+        )
+        if result.returncode != 0:
+            return None
+
+        # Get CUDA version from nvidia-smi
+        result = subprocess.run(
+            ['nvidia-smi'],
+            capture_output=True, text=True, timeout=5, check=False
+        )
+        if result.returncode == 0:
+            # Parse "CUDA Version: X.Y" from output
+            import re
+            match = re.search(r'CUDA Version:\s*(\d+)', result.stdout)
+            if match:
+                return int(match.group(1))
+    except Exception:
+        pass
+    return None
+
+
 def install_onnx_asr(venv_dir: Path, enable_gpu: bool = False) -> bool:
     """
     Install onnx-asr into the main venv.
@@ -1668,9 +1659,25 @@ def install_onnx_asr(venv_dir: Path, enable_gpu: bool = False) -> bool:
     if enable_gpu:
         log_info("Installing onnx-asr with GPU support (CUDA/TensorRT)...")
         try:
-            # Explicitly install onnxruntime-gpu first to ensure it's available
-            log_info("Installing onnxruntime-gpu...")
-            run_command(['uv', 'pip', 'install', '--python', venv_python, 'onnxruntime-gpu'], check=True)
+            # Detect CUDA version for proper onnxruntime-gpu installation
+            cuda_major = _detect_cuda_major_version()
+
+            # Build the install command with appropriate index for CUDA version
+            install_cmd = ['uv', 'pip', 'install', '--python', venv_python]
+
+            if cuda_major and cuda_major >= 13:
+                # CUDA 13+ requires nightly builds (as of Jan 2026)
+                log_info(f"Detected CUDA {cuda_major} - using onnxruntime nightly builds...")
+                install_cmd.extend([
+                    '--extra-index-url',
+                    'https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/'
+                ])
+            else:
+                log_info("Installing onnxruntime-gpu from PyPI...")
+
+            # Install onnxruntime-gpu first
+            run_command(install_cmd + ['onnxruntime-gpu'], check=True)
+
             # Install onnx-asr with GPU backend and HuggingFace hub support
             # [cuda] = onnxruntime-gpu for CUDA/TensorRT (but we install it explicitly above)
             # [hub] = huggingface_hub for model downloads
@@ -1755,69 +1762,6 @@ def _parallel_setup_gpu_and_venv(backend_type: str, force_rebuild: bool = False)
 
     return gpu_status, venv_dir
 
-
-def _parallel_deps_and_wheel(venv_dir: Path, requirements_file: Path, variant: str) -> Tuple[bool, Optional[Path]]:
-    """
-    Download wheel and install base dependencies in parallel.
-
-    Args:
-        venv_dir: Path to venv directory
-        requirements_file: Path to requirements.txt
-        variant: Wheel variant ('cpu', 'cuda118', 'cuda122')
-
-    Returns:
-        Tuple of (deps_installed bool, wheel_path or None)
-    """
-    deps_ok = False
-    wheel_path = None
-    errors = []
-    venv_python = str(venv_dir / 'bin' / 'python')
-
-    def install_deps():
-        """Install base dependencies (excluding pywhispercpp)"""
-        nonlocal deps_ok
-        try:
-            # Filter out pywhispercpp from requirements
-            skip_packages = ['pywhispercpp']
-            if _should_skip_pygobject():
-                skip_packages.append('PyGObject')
-
-            temp_req_path = None
-            try:
-                temp_req_path = _filter_requirements(requirements_file, skip_packages)
-                run_command(['uv', 'pip', 'install', '--python', venv_python,
-                            '-r', str(temp_req_path)], check=True)
-                deps_ok = True
-            finally:
-                if temp_req_path and temp_req_path.exists():
-                    temp_req_path.unlink()
-        except Exception as e:
-            errors.append(f"Deps install error: {e}")
-
-    def download_wheel():
-        """Download pre-built wheel"""
-        nonlocal wheel_path
-        try:
-            wheel_path = download_pywhispercpp_wheel(variant=variant)
-        except Exception as e:
-            errors.append(f"Wheel download error: {e}")
-
-    # Run both in parallel
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        deps_future = executor.submit(install_deps)
-        wheel_future = executor.submit(download_wheel)
-
-        for future in as_completed([deps_future, wheel_future]):
-            try:
-                future.result()
-            except Exception as e:
-                errors.append(str(e))
-
-    if errors:
-        for error in errors:
-            log_debug(error)
-
-    return deps_ok, wheel_path
 
 
 # ==================== Main Installation Function ====================
@@ -1948,14 +1892,10 @@ def install_backend(backend_type: str, cleanup_on_failure: bool = True, force_re
             if not enable_gpu:
                 log_info("Installing onnx-asr (CPU-optimized)")
 
-            # Install base requirements first
-            requirements_file = Path(HYPRWHSPR_ROOT) / 'requirements.txt'
+            # Install base dependencies (excluding pywhispercpp - not needed for ONNX-ASR)
             log_info("Installing base dependencies...")
-            try:
-                run_command(['uv', 'pip', 'install', '--python', venv_python,
-                            '-r', str(requirements_file)], check=True)
-            except subprocess.CalledProcessError as e:
-                error_msg = f"Failed to install base dependencies: {e}"
+            if not sync_dependencies(venv_dir, exclude_packages=['pywhispercpp']):
+                error_msg = "Failed to install base dependencies"
                 log_error(error_msg)
                 if cleanup_on_failure:
                     log_info("Cleaning up partial installation...")
@@ -1993,9 +1933,8 @@ print("Models cached successfully", flush=True)
                 log_warning("Models will be downloaded on first use instead")
                 # Don't fail installation - models can still be downloaded on first use
 
-            # Store requirements hash
-            cur_req_hash = compute_file_hash(requirements_file)
-            set_state("requirements_hash", cur_req_hash)
+            # Store lockfile hash
+            set_state("uv_lock_hash", compute_file_hash(get_uv_lock_file()))
 
             # Installation successful for ONNX-ASR
             set_install_state('completed')
@@ -2010,9 +1949,8 @@ print("Models cached successfully", flush=True)
             created_items['venv_path'] = str(VENV_DIR)
         
         # Check if dependencies are already installed
-        requirements_file = Path(HYPRWHSPR_ROOT) / 'requirements.txt'
-        cur_req_hash = compute_file_hash(requirements_file)
-        stored_req_hash = get_state("requirements_hash")
+        cur_lock_hash = compute_file_hash(get_uv_lock_file())
+        stored_lock_hash = get_state("uv_lock_hash")
 
         venv_python = str(venv_dir / 'bin' / 'python')
 
@@ -2027,13 +1965,13 @@ print("Models cached successfully", flush=True)
             pass
 
         # Install pywhispercpp if needed
-        if cur_req_hash != stored_req_hash or not stored_req_hash or not deps_installed:
-            if not stored_req_hash:
+        if cur_lock_hash != stored_lock_hash or not stored_lock_hash or not deps_installed:
+            if not stored_lock_hash:
                 # First time setup - no stored hash means venv is new
                 log_info("Installing Python dependencies...")
-            elif cur_req_hash != stored_req_hash:
-                # Requirements actually changed
-                log_info("Installing Python dependencies (requirements.txt changed)...")
+            elif cur_lock_hash != stored_lock_hash:
+                # Lockfile changed
+                log_info("Installing Python dependencies (uv.lock changed)...")
             else:
                 # Dependencies missing but hash matches (shouldn't happen often)
                 log_info("Installing Python dependencies (dependencies missing)...")
@@ -2042,53 +1980,11 @@ print("Models cached successfully", flush=True)
                 # GPU build path: install everything except pywhispercpp first
                 log_info("Installing base Python dependencies (excluding pywhispercpp)...")
 
-                # Determine packages to skip
-                skip_pygobject = _should_skip_pygobject()
-
-                # Use a writable temp directory instead of system directory
-                import tempfile
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as temp_req:
-                    temp_req_path = Path(temp_req.name)
-                    try:
-                        with open(requirements_file, 'r', encoding='utf-8') as f_in:
-                            for line in f_in:
-                                line_stripped = line.strip()
-                                # Extract package name for exact matching
-                                pkg_name = _extract_package_name(line_stripped)
-                                # Skip pywhispercpp (built separately with GPU support)
-                                if pkg_name == 'pywhispercpp':
-                                    continue
-                                # Skip PyGObject if already installed as system package
-                                if skip_pygobject and pkg_name == 'pygobject':
-                                    continue
-                                temp_req.write(line)
-
-                        temp_req.flush()
-
-                        if temp_req_path.stat().st_size > 0:
-                            run_command(['uv', 'pip', 'install', '--python', venv_python,
-                                        '-r', str(temp_req_path)],
-                                       check=True, verbose=OutputController.get_verbosity().value >= VerbosityLevel.VERBOSE.value)
-                    except Exception as e:
-                        error_msg = f"Failed to install base Python dependencies: {e}"
-                        log_error(error_msg)
-                        if cleanup_on_failure:
-                            log_info("Cleaning up partial installation...")
-                            # Uninstall any partially installed packages
-                            try:
-                                run_command(['uv', 'pip', 'uninstall', '--python', venv_python] + created_items['packages_installed'],
-                                          check=False, capture_output=True)
-                            except Exception:
-                                pass
-                        set_install_state('failed', error_msg)
-                        return False
-                    finally:
-                        # Clean up temp file
-                        if temp_req_path.exists():
-                            temp_req_path.unlink()
-
-                # Remove any pre-existing pywhispercpp
-                run_command(['uv', 'pip', 'uninstall', '--python', venv_python, 'pywhispercpp'], check=False, capture_output=True)
+                if not sync_dependencies(venv_dir, exclude_packages=['pywhispercpp']):
+                    error_msg = "Failed to install base Python dependencies"
+                    log_error(error_msg)
+                    set_install_state('failed', error_msg)
+                    return False
 
                 # Build pywhispercpp with GPU support
                 if enable_cuda:
@@ -2119,7 +2015,7 @@ print("Models cached successfully", flush=True)
                             log_warning("  • Use REST API transcription backend (see README)")
                             log_warning("")
                             log_info("Installing pywhispercpp with CPU-only support...")
-                            if not install_pywhispercpp_cpu(venv_dir, requirements_file):
+                            if not install_pywhispercpp_cpu(venv_dir):
                                 error_msg = "Failed to install pywhispercpp (CPU-only fallback)"
                                 log_error(error_msg)
                                 set_install_state('failed', error_msg)
@@ -2142,7 +2038,7 @@ print("Models cached successfully", flush=True)
                         # Vulkan build failed - fall back to CPU-only
                         log_warning("Vulkan build failed - falling back to CPU-only installation")
                         log_info("Installing pywhispercpp with CPU-only support...")
-                        if not install_pywhispercpp_cpu(venv_dir, requirements_file):
+                        if not install_pywhispercpp_cpu(venv_dir):
                             error_msg = "Failed to install pywhispercpp (CPU-only fallback)"
                             log_error(error_msg)
                             set_install_state('failed', error_msg)
@@ -2150,16 +2046,16 @@ print("Models cached successfully", flush=True)
                         log_success("pywhispercpp installed (CPU-only mode)")
             else:
                 # CPU-only path: install everything normally
-                if not install_pywhispercpp_cpu(venv_dir, requirements_file):
+                if not install_pywhispercpp_cpu(venv_dir):
                     error_msg = "Failed to install pywhispercpp (CPU-only)"
                     log_error(error_msg)
                     set_install_state('failed', error_msg)
                     return False
 
-            set_state("requirements_hash", cur_req_hash)
+            set_state("uv_lock_hash", cur_lock_hash)
             log_success("Python dependencies installed")
         else:
-            log_info("Python dependencies up to date (skipping uv pip install)")
+            log_info("Python dependencies up to date (skipping uv sync)")
 
         # Download base model
         if not download_pywhispercpp_model('base'):

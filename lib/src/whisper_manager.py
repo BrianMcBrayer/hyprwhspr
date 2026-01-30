@@ -82,6 +82,17 @@ class WhisperManager:
 
             # Configure ONNX-ASR backend (CPU or GPU-optimized)
             if backend == 'onnx-asr':
+                # Add backend venv site-packages to path if needed
+                venv_base = os.path.expanduser('~/.local/share/hyprwhspr/venv/lib')
+                if os.path.isdir(venv_base):
+                    # Find python version directory (e.g., python3.11, python3.12)
+                    for entry in os.listdir(venv_base):
+                        if entry.startswith('python'):
+                            venv_site_packages = os.path.join(venv_base, entry, 'site-packages')
+                            if os.path.isdir(venv_site_packages) and venv_site_packages not in sys.path:
+                                sys.path.insert(0, venv_site_packages)
+                            break
+
                 try:
                     import onnx_asr
                 except ImportError:
@@ -91,12 +102,10 @@ class WhisperManager:
 
                 # Suppress ONNX Runtime verbose error logging
                 # Errors about missing CUDA libraries are expected and will fall back to CPU
-                import os
                 import logging
-                import sys
                 import contextlib
                 from io import StringIO
-                
+
                 # Set ONNX Runtime log level to suppress warnings/errors
                 os.environ['ORT_LOGGING_LEVEL'] = '4'  # 4 = FATAL (suppress ERROR/WARNING/INFO)
                 

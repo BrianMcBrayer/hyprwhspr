@@ -33,9 +33,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.1.0"]
+onnx-gpu = ["onnx-asr[hub]>=0.10.0", "onnxruntime-gpu>=1.24.0"]
+onnx-cpu = ["onnx-asr[cpu,hub]>=0.10.0"]
 
 [project.scripts]
-hyprwhspr = "cli:main"
+hyprwhspr = "lib.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -45,4 +47,13 @@ build-backend = "hatchling.build"
 packages = ["lib"]
 
 [tool.uv]
-package = false
+package = true
+
+# CUDA 13 nightly builds for onnxruntime-gpu
+[[tool.uv.index]]
+name = "ort-cuda-13"
+url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/"
+explicit = true
+
+[tool.uv.sources]
+onnxruntime-gpu = { index = "ort-cuda-13" }
